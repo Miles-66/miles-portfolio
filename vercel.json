@@ -2,19 +2,19 @@
   "cleanUrls": true,
   "headers": [
     {
-      "source": "/(.*\\.(png|PNG|jpg|JPG|jpeg|webp|svg|ico))",
+      "source": "/assets/screenshots/:path*",
       "headers": [
         { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
       ]
     },
     {
-      "source": "/(.*\\.mp4)",
+      "source": "/assets/videos/:path*",
       "headers": [
         { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
       ]
     },
     {
-      "source": "/assets/readmes/(.*)",
+      "source": "/assets/readmes/:path*",
       "headers": [
         { "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }
       ]
