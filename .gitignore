@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+._*
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code workspace config
+.claude/
+
+# Node (if ever added)
+node_modules/
+
+# Logs
+*.log
+
+# Unused media / drafts (kept locally, not published)
+assets/videos/ttnet.mp4
+assets/videos/回忆空间v4_final*.html
+assets/screenshots/moment1.png
+assets/国企遇上ai——三千字大纲.docx
+
+# PRD (optional: uncomment to exclude from repo)
+# portfolio-prd.md

@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Memory Recall — v3 Snell Blend</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body, html {
+            margin:0; padding:0; width:100%; height:100%;
+            overflow:hidden; background:#1B424F;
+            touch-action:none; user-select:none;
+            font-family:-apple-system,"PingFang SC",sans-serif;
+            -webkit-font-smoothing:antialiased;
+        }
+        #c { position:absolute; top:0; left:0; width:100%; height:100%; }
+        .sediment-layer {
+            position:absolute; top:0; left:0; width:100%; height:100%;
+            z-index:2; pointer-events:none;
+            filter:url(#sand-noise); mix-blend-mode:overlay; opacity:0.04;
+        }
+        .memory-container {
+            position:absolute; bottom:12%; width:100%;
+            text-align:center; pointer-events:none;
+            z-index:50; display:flex; flex-direction:column; gap:6px;
+        }
+        .memory-quote {
+            font-size:0.95rem; letter-spacing:0.05em; font-weight:300;
+            color:rgba(230,230,230,0.85);
+            opacity:0; transform:translateY(6px);
+            transition:opacity 0.3s,transform 0.3s;
+        }
+        .memory-meta {
+            font-size:0.7rem; letter-spacing:0.1em; font-weight:400;
+            color:rgba(180,180,180,0.4);
+            opacity:0; transform:translateY(4px);
+            transition:opacity 0.3s,transform 0.3s;
+        }
+        .memory-container.visible .memory-quote {
+            opacity:1; transform:translateY(0);
+            transition:opacity 0.8s ease 0.6s,transform 0.8s ease 0.6s;
+        }
+        .memory-container.visible .memory-meta {
+            opacity:1; transform:translateY(0);
+            transition:opacity 0.8s ease 1.0s,transform 0.8s ease 1.0s;
+        }
+    </style>
+</head>
+<body>
+<svg style="display:none">
+    <filter id="sand-noise">
+        <feTurbulence type="fractalNoise" baseFrequency="1.2" numOctaves="3" stitchTiles="stitch"/>
+        <feColorMatrix type="matrix" values="1 0 0 0 0,0 0.9 0 0 0,0 0.8 0 0 0,0 0 0 0.15 0"/>
+    </filter>
+</svg>
+
+<canvas id="c"></canvas>
+<div class="sediment-layer"></div>
+<div id="memory-container" class="memory-container">
+    <div class="memory-quote">那天的风很轻，我们都没有说话。</div>
+    <div class="memory-meta">Paris, Rue de l'Aube · 2024.03.13</div>
+</div>
+
+<script>
+// ── 碎片 shader：完整移植自 v2（折射 + 形态渐变 + 焦点修正）──────────────────
+const memVert=`
+varying vec2 vUv;
+void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}
+`;
+
+const memFrag=`
+uniform sampler2D tDiffuse;
+uniform float uDepth,uTime,uOpacity,uFocus;
+uniform vec3 uFallbackColor;
+uniform float uUseColor;
+varying vec2 vUv;
+
+void main(){
+    vec2 uv=vUv;
+
+    // v2 的折射：中心 40% 几乎不折射，边缘折射增强
+    float distFromCenter=distance(vUv,vec2(0.5));
+    float refractionMask=smoothstep(0.2,0.6,distFromCenter);
+    float lowFreq=sin(uv.y*4.0+uTime*0.2)*cos(uv.x*3.0-uTime*0.15);
+    float highFreq=sin(uv.y*60.0+uTime*4.0)*0.002;
+    float refractionLevel=uDepth*0.025*refractionMask;
+    uv.x+=(lowFreq*refractionLevel)+(highFreq*refractionMask);
+    uv.y+=(lowFreq*refractionLevel*0.5);
+
+    vec3 baseColor=mix(texture2D(tDiffuse,uv).rgb, uFallbackColor, uUseColor);
+
+    // v2 的形态渐变遮罩
+    float reach=0.48-(uDepth*0.33);
+    float morphNoise=sin(vUv.x*3.0+uTime*0.2)*cos(vUv.y*3.0-uTime*0.2)*uDepth;
+    float softness=0.02+(uDepth*0.3);
+    float focalReach=reach+(uFocus*0.05);
+    float focalSoftness=softness*(1.0-uFocus*0.4);
+    float finalMask=1.0-smoothstep(0.0,focalSoftness,
+        length(max(abs(vUv-0.5)-(focalReach+morphNoise*0.1),0.0)));
+
+    // v2 的颜色提透
+    vec3 waterColor=vec3(0.1,0.4,0.5);
+    vec3 tint=mix(vec3(1.),waterColor,uDepth*0.2);
+    float brightness=(1.1-uDepth*0.1)+(uFocus*0.1);
+
+    gl_FragColor=vec4(baseColor*tint*brightness,finalMask*uOpacity);
+}
+`;
+
+// ── 天光面 shader：完整移植自 v2（保持 v2 的清亮焦散）─────────────────────────
+const surfVert=`varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`;
+const surfFrag=`
+precision highp float;
+uniform float uTime;
+uniform vec2 uFragOffset; // 碎片加权平均位置，映射到屏幕空间偏移
+varying vec2 vUv;
+
+float hash(vec2 p){
+    return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123);
+}
+float noise(vec2 p){
+    vec2 i=floor(p); vec2 f=fract(p);
+    float a=hash(i),b=hash(i+vec2(1.,0.)),
+          c=hash(i+vec2(0.,1.)),d=hash(i+vec2(1.,1.));
+    vec2 u=f*f*(3.0-2.0*f);
+    return mix(a,b,u.x)+(c-a)*u.y*(1.0-u.x)+(d-b)*u.x*u.y;
+}
+
+float iterCaustics(vec2 uv,float time){
+    uv*=2.5;
+    vec2 p=mod(uv*6.283,6.283)-250.; vec2 i=p; float c=1.;
+    for(int n=0;n<5;n++){
+        float t=time*(1.-(3.5/float(n+1)));
+        i=p+vec2(cos(t-i.x)+sin(t+i.y),sin(t-i.y)+cos(t+i.x));
+        c+=1./length(vec2(p.x/(sin(i.x+t)/0.005),p.y/(cos(i.y+t)/0.005)));
+    }
+    c/=5.; c=1.17-pow(c,1.4); return pow(abs(c),8.0);
+}
+
+void main(){
+    vec2 uv=vUv;
+
+    // noise 背景（来自 v3水感）
+    vec3 deepBlue=vec3(0.10,0.24,0.29);
+    vec3 midBlue =vec3(0.18,0.42,0.47);
+    vec3 topLight=vec3(0.62,0.86,0.92);
+
+    float topGrad=smoothstep(1.15,0.10,uv.y);
+    float drift =noise(vec2(uv.x*2.2,uv.y*1.7+uTime*0.015));
+    float drift2=noise(vec2(uv.x*3.8-uTime*0.012,uv.y*2.4));
+
+    vec2 c1=vec2(0.34,0.42); vec2 c2=vec2(0.70,0.58);
+    float p1=1.0-smoothstep(0.0,0.24,distance(uv,c1));
+    float p2=1.0-smoothstep(0.0,0.20,distance(uv,c2));
+    float pools=p1*0.75+p2*0.55;
+
+    // caustics：sin×sin 约束在透光区内
+    float caust=sin((uv.x+uTime*0.03)*18.0)*0.5+0.5;
+    caust*=sin((uv.y-uTime*0.02)*13.0)*0.5+0.5;
+    caust=smoothstep(0.78,1.0,caust);
+    caust*=(0.25+pools*0.75);
+
+    // 颜色结构
+    vec3 color=mix(deepBlue,midBlue,topGrad*0.52);
+    color=mix(color,topLight,topGrad*0.22);
+    color+=topLight*pools*0.10;
+    color+=topLight*caust*0.09;
+
+    // 方向性漂移：X取负修正镜像，右下方向
+    vec2 caustUv = uv
+        + vec2(-uTime*0.01823, uTime*0.00911)   // 方向性漂移（右下）
+        + uFragOffset * 0.015;              // 最近碎片跟随，幅度更小
+    float ic=iterCaustics(caustUv, uTime*0.07);
+    color+=topLight*ic*0.05;
+
+    color+=vec3((drift*0.5+drift2*0.5)*0.018);
+
+    gl_FragColor=vec4(color,1.);
+}
+`;
+
+// ── 后处理：v2 的水面扰动 + 轻量 Snell's Window 叠加 ───────────────────────────
+// 关键：deepWater 提升至接近 v2 底色，光锥只做温和提亮，不做极端对比
+const postVert=`varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position,1.);}`;
+const postFrag=`
+precision highp float;
+uniform sampler2D tDiffuse;
+uniform float uTime,uSpeedMult;
+varying vec2 vUv;
+
+void main(){
+    vec2 uv=vUv;
+
+    // 局部折射区：上方更活跃，两个固定透光区折射更强（v3_3水感）
+    float topInfluence=smoothstep(0.95,0.15,uv.y);
+    vec2 c1=vec2(0.36,0.36); vec2 c2=vec2(0.68,0.52);
+    float p1=1.0-smoothstep(0.0,0.22,distance(uv,c1));
+    float p2=1.0-smoothstep(0.0,0.18,distance(uv,c2));
+    float influence=topInfluence*0.55+max(p1,p2)*0.45;
+
+    // 高频细纹，极小幅度，只在 influence 区域生效
+    float waveX=sin(uv.y*11.0+uTime*0.08*uSpeedMult)*0.0018;
+    float waveY=cos(uv.x*9.0 +uTime*0.06*uSpeedMult)*0.0015;
+    vec2 distortedUv=uv+vec2(waveX,waveY)*influence;
+
+    vec4 color=texture2D(tDiffuse,distortedUv);
+
+    // 极轻色散，只在最外圈
+    float distToCenter=distance(uv,vec2(0.5));
+    float caStrength=smoothstep(0.72,1.0,distToCenter)*0.0009*uSpeedMult;
+    float r=texture2D(tDiffuse,distortedUv+vec2(caStrength,0.)).r;
+    float g=color.g;
+    float b=texture2D(tDiffuse,distortedUv-vec2(caStrength,0.)).b;
+    vec3 scene=vec3(r,g,b);
+
+    // Snell's Window 加性叠加（v3snell，保持底色不变）
+    float drift=sin(uTime*0.07)*0.012;
+    float drift2=cos(uTime*0.05)*0.007;
+    vec2 lightCenter=vec2(0.5+drift,0.42+drift2);
+    float snellOuter=pow(max(0.,1.-distance(uv,lightCenter)*1.6),2.0);
+    float snellInner=pow(max(0.,1.-distance(uv,lightCenter)*3.2),3.5);
+    vec3 glowOuter=vec3(0.03,0.07,0.10)*snellOuter;
+    vec3 glowInner=vec3(0.04,0.10,0.14)*snellInner;
+
+    gl_FragColor=vec4(scene+glowOuter+glowInner,1.);
+}
+`;
+
+// ── Scene ─────────────────────────────────────────────────────────────────────
+const canvas=document.getElementById('c');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:false,powerPreference:'high-performance'});
+renderer.setSize(innerWidth,innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+
+const scene=new THREE.Scene();
+const BASE='#1B424F'; // v2 底色
+scene.background=new THREE.Color(BASE);
+scene.fog=new THREE.FogExp2(BASE,0.0015); // v2 的雾气浓度（很薄，保持透明感）
+
+const camera=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,100);
+camera.position.set(0,0,0);
+camera.lookAt(0,10,0);
+
+const clock=new THREE.Clock();
+const texLoader=new THREE.TextureLoader();
+const fragments=[];
+
+// 粒子：方案B——每颗独立速度，整体跟水流方向，带随机扰动
+const pCount=53;
+const pArr=new Float32Array(pCount*3);   // 位置
+const pVel=new Float32Array(pCount*3);   // 速度
+
+// 水流主方向（左下：X正=屏幕左，Y负=向下，Z负）
+const flowX=0.002, flowY=-0.0015, flowZ=-0.001;
+
+for(let i=0;i<pCount;i++){
+    pArr[i*3]  =(Math.random()-.5)*25;
+    pArr[i*3+1]=Math.random()*30;
+    pArr[i*3+2]=(Math.random()-.5)*25;
+    // 扰动幅度远小于基础速度，避免有粒子反向飞回
+    pVel[i*3]  =flowX+(Math.random()-.5)*0.0008;
+    pVel[i*3+1]=flowY+(Math.random()-.5)*0.0006;
+    pVel[i*3+2]=flowZ+(Math.random()-.5)*0.0006;
+}
+const pGeo=new THREE.BufferGeometry();
+const pPosAttr=new THREE.BufferAttribute(pArr,3);
+pPosAttr.setUsage(THREE.DynamicDrawUsage); // 每帧更新
+pGeo.setAttribute('position',pPosAttr);
+const pMat=new THREE.PointsMaterial({
+    color:0xBAE6FF,size:0.012,transparent:true,opacity:0.28,
+    blending:THREE.AdditiveBlending
+});
+const particles=new THREE.Points(pGeo,pMat);
+scene.add(particles);
+
+// 天光面（v2 的 caustics，保持 AdditiveBlending）
+const surfMat=new THREE.ShaderMaterial({
+    vertexShader:surfVert,fragmentShader:surfFrag,
+    uniforms:{uTime:{value:0}, uFragOffset:{value:new THREE.Vector2(0,0)}},
+    depthWrite:false,transparent:true,blending:THREE.AdditiveBlending
+});
+const surf=new THREE.Mesh(new THREE.PlaneGeometry(100,100),surfMat);
+surf.position.set(0,40,0); surf.rotation.x=Math.PI/2;
+scene.add(surf);
+
+// 碎片：优先 Unsplash，失败降级纯色
+const fallbackColors=[
+    new THREE.Color(0.55,0.45,0.38),
+    new THREE.Color(0.38,0.50,0.54),
+    new THREE.Color(0.50,0.42,0.35),
+    new THREE.Color(0.35,0.46,0.50),
+    new THREE.Color(0.48,0.40,0.36),
+];
+const whitePixel=new THREE.DataTexture(new Uint8Array([255,255,255,255]),1,1,THREE.RGBAFormat);
+whitePixel.needsUpdate=true;
+
+function spawnFrag(tex,useColor,fbColor,index){
+    const isCentral=index===0;
+    const depth=isCentral?0.1:0.3+Math.random()*0.6;
+    const mat=new THREE.ShaderMaterial({
+        vertexShader:memVert,fragmentShader:memFrag,
+        uniforms:{
+            tDiffuse:{value:tex},uDepth:{value:depth},
+            uTime:{value:0},uOpacity:{value:0},uFocus:{value:0},
+            uFallbackColor:{value:fbColor},uUseColor:{value:useColor?1.0:0.0}
+        },
+        transparent:true,depthWrite:false,blending:THREE.NormalBlending
+    });
+    const w=6+Math.random()*4, h=w*1.2;
+    const mesh=new THREE.Mesh(new THREE.PlaneGeometry(w,h,16,16),mat);
+    const yPos=5+depth*25;
+    const xPos=isCentral?0:(Math.random()-.5)*15;
+    const zPos=isCentral?0:(Math.random()-.5)*15;
+    const rotZ=(Math.random()-.5)*0.5;
+    mesh.position.set(xPos,yPos,zPos);
+    mesh.rotation.x=Math.PI/2; mesh.rotation.z=rotZ;
+    mesh.userData={
+        baseY:yPos,baseDepth:depth,flowX:xPos,flowZ:zPos,
+        speedX:(Math.random()-.5)*0.02,speedZ:(Math.random()-.5)*0.02,
+        baseRotZ:rotZ,targetOpacity:isCentral?0.9:0.6-depth*0.3
+    };
+    scene.add(mesh); fragments.push(mesh);
+}
+
+const urls=[
+    'https://images.unsplash.com/photo-1516414447565-b14be0adf13e?q=80&w=800&auto=format&fit=crop',
+    'https://images.unsplash.com/photo-1493246507139-91e8fad9978e?q=80&w=800&auto=format&fit=crop',
+    'https://images.unsplash.com/photo-1447752875215-b2761acb3c5d?q=80&w=800&auto=format&fit=crop',
+    'https://images.unsplash.com/photo-1478760329108-5c3ed9d495a0?q=80&w=800&auto=format&fit=crop',
+    'https://images.unsplash.com/photo-1534447677768-be436bb09401?q=80&w=800&auto=format&fit=crop'
+];
+urls.forEach((url,i)=>{
+    texLoader.load(url,
+        tex=>spawnFrag(tex,false,fallbackColors[i],i),
+        undefined,
+        ()=>spawnFrag(whitePixel,true,fallbackColors[i],i)
+    );
+});
+
+// ── 交互 ──────────────────────────────────────────────────────────────────────
+const ray=new THREE.Raycaster(), ptr=new THREE.Vector2(-10,-10);
+let active=null,holding=false,globalSpeed=1;
+
+window.addEventListener('pointerdown',e=>{
+    holding=true;
+    ptr.x=(e.clientX/innerWidth)*2-1;
+    ptr.y=-(e.clientY/innerHeight)*2+1;
+    ray.setFromCamera(ptr,camera);
+    const h=ray.intersectObjects(fragments);
+    if(h.length) active=h[0].object;
+});
+window.addEventListener('pointerup',   ()=>{holding=false;active=null;});
+window.addEventListener('pointercancel',()=>{holding=false;active=null;});
+
+// ── 后处理 ────────────────────────────────────────────────────────────────────
+const rt=new THREE.WebGLRenderTarget(innerWidth,innerHeight,{
+    minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,format:THREE.RGBAFormat
+});
+const ortho=new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+const postMat=new THREE.ShaderMaterial({
+    vertexShader:postVert,fragmentShader:postFrag,
+    uniforms:{tDiffuse:{value:rt.texture},uTime:{value:0},uSpeedMult:{value:1}}
+});
+const postScene=new THREE.Scene();
+postScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2),postMat));
+
+// ── 渲染循环 ──────────────────────────────────────────────────────────────────
+function animate(){
+    requestAnimationFrame(animate);
+    const t=clock.getElapsedTime();
+    surfMat.uniforms.uTime.value=t;
+
+    // 只取离屏幕中心最近的碎片，用距离做衰减
+    // 碎片飘近时光网尾部微微跟随，远离时归零
+    let nearX=0, nearZ=0;
+    if(fragments.length>0){
+        let minDist=Infinity;
+        fragments.forEach(f=>{
+            const d=Math.sqrt(f.position.x**2+f.position.z**2);
+            if(d<minDist){ minDist=d; nearX=f.position.x; nearZ=f.position.z; }
+        });
+        // 距离越近影响越大，超过8单位后归零
+        const proximity=Math.max(0, 1-minDist/8);
+        nearX*=proximity;
+        nearZ*=proximity;
+    }
+    const cur=surfMat.uniforms.uFragOffset.value;
+    cur.x+=(nearX/18-cur.x)*0.015; // 延迟跟随，更慢更柔
+    cur.y+=(nearZ/18-cur.y)*0.015;
+
+    pMat.opacity=0.18+Math.sin(t*0.5)*0.06;
+
+    // 每颗粒子独立更新位置
+    for(let i=0;i<pCount;i++){
+        pArr[i*3]  +=pVel[i*3]  *globalSpeed;
+        pArr[i*3+1]+=pVel[i*3+1]*globalSpeed;
+        pArr[i*3+2]+=pVel[i*3+2]*globalSpeed;
+
+        // 边界包裹：从下游边界出去，从上游边界进来
+        if(pArr[i*3]  >  13) pArr[i*3]   = -13; // X正方向流出，从左侧进
+        if(pArr[i*3]  < -13) pArr[i*3]   =  13;
+        if(pArr[i*3+1]<   0) pArr[i*3+1] =  30; // Y向下流出，从顶部进
+        if(pArr[i*3+1]>  30) pArr[i*3+1] =   0;
+        if(pArr[i*3+2]< -13) pArr[i*3+2] =  13; // Z负方向流出，从正侧进
+        if(pArr[i*3+2]>  13) pArr[i*3+2] = -13;
+    }
+    pPosAttr.needsUpdate=true;
+
+    globalSpeed+=(((holding&&active)?0.05:1.0)-globalSpeed)*0.05;
+
+    fragments.forEach(f=>{
+        const a=(holding&&f===active);
+        if(!a){
+            f.userData.flowX+=(f.userData.speedX+0.0035)*globalSpeed;
+            f.userData.flowZ+=(f.userData.speedZ+0.0035)*globalSpeed;
+            f.userData.baseRotZ+=0.0003*globalSpeed;
+            if(f.userData.flowX>18) f.userData.flowX=-18;
+            if(f.userData.flowZ>18) f.userData.flowZ=-18;
+        }
+        const tY=a?11:f.userData.baseY;
+        const tX=a?0:f.userData.flowX;
+        const tZ=a?0:f.userData.flowZ;
+        const tR=a?0:f.userData.baseRotZ;
+        const tD=a?0:f.userData.baseDepth;
+        const tO=a?1:f.userData.targetOpacity;
+        const e=a?0.08:0.03;
+
+        if(Math.abs(tX-f.position.x)>20||Math.abs(tZ-f.position.z)>20){
+            f.position.x=tX; f.position.z=tZ;
+        } else {
+            f.position.x+=(tX-f.position.x)*e;
+            f.position.z+=(tZ-f.position.z)*e;
+        }
+        f.position.y+=(tY-f.position.y)*e;
+        f.rotation.z+=(tR-f.rotation.z)*e;
+        f.material.uniforms.uDepth.value  +=(tD-f.material.uniforms.uDepth.value  )*e;
+        f.material.uniforms.uOpacity.value+=(tO-f.material.uniforms.uOpacity.value)*e;
+        f.material.uniforms.uTime.value=t;
+
+        const d=Math.sqrt(f.position.x**2+f.position.z**2);
+        let tf=THREE.MathUtils.smoothstep(8,0,d);
+        if(a) tf=1;
+        f.material.uniforms.uFocus.value+=(tf-f.material.uniforms.uFocus.value)*0.05;
+        f.renderOrder=a?100:1;
+    });
+
+    const el=document.getElementById('memory-container');
+    (active&&holding)?el.classList.add('visible'):el.classList.remove('visible');
+
+    postMat.uniforms.uTime.value=t;
+    postMat.uniforms.uSpeedMult.value=globalSpeed;
+    renderer.setRenderTarget(rt);
+    renderer.render(scene,camera);
+    renderer.setRenderTarget(null);
+    renderer.render(postScene,ortho);
+}
+
+window.addEventListener('resize',()=>{
+    camera.aspect=innerWidth/innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth,innerHeight);
+    rt.setSize(innerWidth,innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>
